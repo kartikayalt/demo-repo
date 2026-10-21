@@ -1,0 +1,67 @@
+# Syncs pull request data (owner, repository, PR, commits, changed files, activity)
+# into the Pulse PR Approval Gateway tables in Supabase.
+#
+# Uses pull_request_target so the workflow + script always run from the default
+# branch (a PR cannot modify them to read the DB secret) and fork PRs are covered.
+# PR code is never checked out or executed.
+name: Pulse PR Sync
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review, edited, closed]
+  workflow_dispatch:
+    inputs:
+      state:
+        description: "Backfill PRs in this state"
+        type: choice
+        options: [all, open, closed]
+        default: all
+      max_prs:
+        description: "Maximum number of PRs to backfill (newest first)"
+        default: "100"
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  statuses: read
+
+# One sync at a time per repository: the tables have no unique keys, so parallel
+# runs could otherwise create duplicate owner/repository rows.
+concurrency:
+  group: pulse-pr-sync-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: pulse-pr-sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout sync script (default branch only)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install --quiet "psycopg2-binary==2.9.10"
+
+      - name: Sync to Supabase
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Preferred: REST API (needs the service_role grant on the schema)
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # Fallback: direct Postgres via the Supabase pooler (used when the two above are unset)
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SUPABASE_SCHEMA: ${{ vars.PULSE_SUPABASE_SCHEMA || 'solution_7df54fce_dd04_44aa_b5a3_efb38820254c' }}
+          SYSTEM_USER_ID: ${{ vars.PULSE_SYSTEM_USER_ID || '00000000-0000-0000-0000-000000000000' }}
+          BACKFILL_STATE: ${{ inputs.state }}
+          BACKFILL_MAX_PRS: ${{ inputs.max_prs }}
+        run: python .github/scripts/sync_pr_to_supabase.py
